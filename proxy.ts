@@ -21,6 +21,9 @@ export default async function middleware(
       "/cart",
       "/cart/step-up",
       "/cart/confirm",
+      "/mcp",
+      "/.well-known/ucp",
+      "/api/ucp/session/*",
     ],
   })
   const response = await withAuth(req)

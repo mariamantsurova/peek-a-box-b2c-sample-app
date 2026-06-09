@@ -1,22 +1,92 @@
 "use client"
 
 import Link from "next/link"
-import { useRouter } from "next/navigation"
+import { useRouter, useSearchParams } from "next/navigation"
+import { useEffect, useState } from "react"
 import { motion, AnimatePresence } from "motion/react"
-import { X, ArrowLeft } from "lucide-react"
-import { useSession } from "@descope/nextjs-sdk/client"
-import { useCart } from "@/components/cart-provider"
+import { X, ArrowLeft, Bot } from "lucide-react"
+import { useSession, useDescope } from "@descope/nextjs-sdk/client"
+import { useCart, type CartItem } from "@/components/cart-provider"
 import { AppNav } from "@/components/app-nav"
 import { Button } from "@/components/ui/button"
 
 export default function CartPage() {
   const router = useRouter()
-  const { items, removeFromCart, totalPrice } = useCart()
+  const searchParams = useSearchParams()
+  const { items, addToCart, removeFromCart, clearCart, totalPrice } = useCart()
   const { isAuthenticated, isSessionLoading } = useSession()
+  const sdk = useDescope()
+  const [agentSession, setAgentSession] = useState<string | null>(null)
+  const [sessionLoading, setSessionLoading] = useState(false)
+  const [sessionError, setSessionError] = useState<string | null>(null)
+  // True while we're verifying an embedded link token — prevents the
+  // "Sign in to checkout" button from flashing before auth resolves.
+  const [magicLinkVerifying, setMagicLinkVerifying] = useState(
+    () => typeof window !== "undefined" && new URLSearchParams(window.location.search).has("t")
+  )
+
+  // Verify an embedded link token from the continue_url (?t=...).
+  // The MCP server embeds this when Identity Linking is complete so the user
+  // is auto-logged in regardless of which device or browser they use.
+  useEffect(() => {
+    const token = searchParams.get("t")
+    if (!token) return
+
+    // Remove the token from the URL immediately — it's one-time use.
+    const params = new URLSearchParams(searchParams.toString())
+    params.delete("t")
+    const qs = params.size > 0 ? `?${params.toString()}` : ""
+    router.replace(`/cart${qs}`, { scroll: false })
+
+    sdk.magicLink.verify(token).finally(() => setMagicLinkVerifying(false))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Hydrate cart from a UCP checkout session created by an agent
+  useEffect(() => {
+    const sessionId = searchParams.get("session")
+    if (!sessionId) return
+
+    setSessionLoading(true)
+    setSessionError(null)
+
+    fetch(`/api/ucp/session/${encodeURIComponent(sessionId)}`)
+      .then(async (res) => {
+        const data = await res.json().catch(() => null) as {
+          error?: string
+          cartItems?: Omit<CartItem, "quantity">[]
+        } | null
+        if (!res.ok || data?.error) {
+          setSessionError(data?.error ?? "Failed to load agent session")
+          return
+        }
+        if (!data?.cartItems?.length) {
+          setSessionError("Session not found or empty")
+          return
+        }
+        clearCart()
+        for (const item of data.cartItems) {
+          addToCart(item)
+        }
+        setAgentSession(sessionId)
+      })
+      .catch(() => setSessionError("Failed to load agent session"))
+      .finally(() => setSessionLoading(false))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const handleCheckout = () => {
     if (!isAuthenticated) {
-      router.push("/login?returnTo=/cart")
+      // Identity Linking OAuth gives the AGENT a token for user-authenticated
+      // MCP calls — the code/token flow terminates at the agent's redirect_uri,
+      // not here. The business storefront session is completely independent.
+      // Users always need to sign in to this site to place an order, regardless
+      // of whether the agent did Identity Linking, and regardless of which
+      // device or browser they use to follow the continue_url.
+      const returnTo = agentSession
+        ? `/cart?session=${encodeURIComponent(agentSession)}`
+        : "/cart"
+      router.push(`/login?returnTo=${encodeURIComponent(returnTo)}`)
       return
     }
     if (items.length >= 2) {
@@ -46,6 +116,32 @@ export default function CartPage() {
         </Link>
 
         <h1 className="mt-8 text-4xl font-semibold tracking-tight sm:text-5xl">Your cart</h1>
+
+        {/* Agent session banner */}
+        {sessionLoading && (
+          <div className="mt-6 flex items-center gap-3 rounded-xl border border-border bg-muted/50 px-5 py-4 text-base text-muted-foreground">
+            <Bot className="h-5 w-5 shrink-0 animate-pulse" />
+            Loading your agent-prepared cart…
+          </div>
+        )}
+        {sessionError && (
+          <div className="mt-6 rounded-xl border border-destructive/30 bg-destructive/5 px-5 py-4 text-base text-destructive">
+            Could not load agent session: {sessionError}
+          </div>
+        )}
+        {agentSession && !sessionLoading && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mt-6 flex items-start gap-3 rounded-xl border border-border bg-muted/50 px-5 py-4 text-base"
+          >
+            <Bot className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
+            <p className="text-muted-foreground">
+              Your cart was prepared by an AI agent.{" "}
+              <span className="text-foreground">Review and confirm below.</span>
+            </p>
+          </motion.div>
+        )}
 
         <AnimatePresence mode="wait">
           {isEmpty ? (
@@ -160,21 +256,21 @@ export default function CartPage() {
                   </dl>
                   <button
                     onClick={handleCheckout}
-                    disabled={isSessionLoading}
+                    disabled={isSessionLoading || magicLinkVerifying}
                     className="mt-6 w-full rounded-full bg-foreground py-3.5 text-base font-medium text-background transition-colors hover:bg-foreground/90 disabled:opacity-50 sm:text-lg"
                   >
-                    {isSessionLoading
-                      ? "Checking out..."
+                    {isSessionLoading || magicLinkVerifying
+                      ? "Signing you in…"
                       : isAuthenticated
                         ? "Place order"
                         : "Sign in to checkout"}
                   </button>
-                  {items.length >= 2 && isAuthenticated && !isSessionLoading && (
+                  {items.length >= 2 && isAuthenticated && !isSessionLoading && !magicLinkVerifying && (
                     <p className="mt-4 text-center text-base text-muted-foreground sm:text-lg">
                       Due to the high value of items in your cart, you'll be asked to re-verify your identity before your order is confirmed.
                     </p>
                   )}
-                  {!isAuthenticated && !isSessionLoading && (
+                  {!isAuthenticated && !isSessionLoading && !magicLinkVerifying && (
                     <p className="mt-4 text-center text-base text-muted-foreground sm:text-lg">
                       Sign in to complete your purchase.
                     </p>
