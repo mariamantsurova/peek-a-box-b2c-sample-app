@@ -15,6 +15,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.exceptions import AuthorizationError
 from fastmcp.server.auth.providers.descope import DescopeProvider
 from fastmcp.server.dependencies import get_access_token
 from starlette.requests import Request
@@ -114,16 +115,10 @@ def _get_token_scopes() -> set[str]:
     return set()
 
 
-def _require_scope(scope: str) -> dict | None:
-    """Return an error response if the required scope is not present, else None."""
+def _require_scope(scope: str) -> None:
+    """Raise AuthorizationError (→ HTTP 403) if the required scope is not present."""
     if scope not in _get_token_scopes():
-        return {
-            "ucp": {"version": UCP_VERSION, "status": "error"},
-            "messages": [{"type": "error", "code": "insufficient_scope",
-                          "content": f"The '{scope}' scope is required for this action.",
-                          "severity": "unrecoverable"}],
-        }
-    return None
+        raise AuthorizationError(f"The '{scope}' scope is required for this action.")
 
 
 # ── In-memory checkout store ──────────────────────────────────────────────────
@@ -200,8 +195,7 @@ def lookup_catalog(
         category: Filter by category — one of 'bestsellers', 'new', or 'premium'.
         limit: Maximum number of results to return (default 20).
     """
-    if err := _require_scope("catalog:read"):
-        return err
+    _require_scope("catalog:read")
     results = PRODUCTS
     if category:
         results = [p for p in results if p["category"] == category]
@@ -221,8 +215,7 @@ def get_product(id: str) -> dict:
     Args:
         id: The product ID (e.g. 'box-42').
     """
-    if err := _require_scope("catalog:read"):
-        return err
+    _require_scope("catalog:read")
     product = next((p for p in PRODUCTS if p["id"] == id), None)
     if not product:
         return {
@@ -254,8 +247,7 @@ def create_checkout(
         buyer: Optional buyer info with email, first_name, last_name.
         fulfillment: Optional fulfillment with shipping destinations.
     """
-    if err := _require_scope("cart:write"):
-        return err
+    _require_scope("cart:write")
     if not line_items:
         return {
             "ucp": {"version": UCP_VERSION, "status": "error"},
@@ -380,8 +372,7 @@ def get_checkout(id: str) -> dict:
     Args:
         id: The checkout session ID returned by create_checkout.
     """
-    if err := _require_scope("cart:write"):
-        return err
+    _require_scope("cart:write")
     return _get_checkout_response(id)
 
 
@@ -418,8 +409,7 @@ def update_checkout(
         fulfillment: Updated fulfillment / shipping details (optional).
         currency: Updated currency code (optional).
     """
-    if err := _require_scope("cart:write"):
-        return err
+    _require_scope("cart:write")
     checkout = _checkouts.get(id)
     if not checkout:
         return {
@@ -463,8 +453,7 @@ def complete_checkout(
         idempotency_key: A UUID for retry safety (required by UCP spec).
         payment: Payment credentials / token (optional for sample app).
     """
-    if err := _require_scope("checkout:write"):
-        return err
+    _require_scope("checkout:write")
     checkout = _checkouts.get(id)
     if not checkout:
         return {
@@ -560,8 +549,7 @@ def cancel_checkout(id: str, idempotency_key: str) -> dict:
         id: The checkout session ID to cancel.
         idempotency_key: A UUID for retry safety (required by UCP spec).
     """
-    if err := _require_scope("cart:write"):
-        return err
+    _require_scope("cart:write")
     checkout = _checkouts.get(id)
     if not checkout:
         return {
