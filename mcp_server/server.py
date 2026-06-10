@@ -13,9 +13,10 @@ import time
 import uuid
 from typing import Optional
 
+from starlette.types import ASGIApp, Receive, Scope as ASGIScope, Send
+
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from fastmcp.exceptions import AuthorizationError
 from fastmcp.server.auth.providers.descope import DescopeProvider
 from fastmcp.server.dependencies import get_access_token
 from starlette.requests import Request
@@ -115,10 +116,17 @@ def _get_token_scopes() -> set[str]:
     return set()
 
 
-def _require_scope(scope: str) -> None:
-    """Raise AuthorizationError (→ HTTP 403) if the required scope is not present."""
+def _require_scope(scope: str) -> dict | None:
+    """Return a structured error dict if the required scope is not present, else None.
+    """
     if scope not in _get_token_scopes():
-        raise AuthorizationError(f"The '{scope}' scope is required for this action.")
+        return {
+            "ucp": {"version": UCP_VERSION, "status": "error"},
+            "error": "insufficient_scope",
+            "required_scopes": [scope],
+            "error_description": f"The '{scope}' scope is required for this action",
+        }
+    return None
 
 
 # ── In-memory checkout store ──────────────────────────────────────────────────
@@ -245,7 +253,8 @@ def create_checkout(
         buyer: Optional buyer info with email, first_name, last_name.
         fulfillment: Optional fulfillment with shipping destinations.
     """
-    _require_scope("checkout:write")
+    if err := _require_scope("checkout:write"):
+        return err
     if not line_items:
         return {
             "ucp": {"version": UCP_VERSION, "status": "error"},
@@ -370,7 +379,8 @@ def get_checkout(id: str) -> dict:
     Args:
         id: The checkout session ID returned by create_checkout.
     """
-    _require_scope("cart:write")
+    if err := _require_scope("cart:write"):
+        return err
     return _get_checkout_response(id)
 
 
@@ -407,7 +417,8 @@ def update_checkout(
         fulfillment: Updated fulfillment / shipping details (optional).
         currency: Updated currency code (optional).
     """
-    _require_scope("cart:write")
+    if err := _require_scope("cart:write"):
+        return err
     checkout = _checkouts.get(id)
     if not checkout:
         return {
@@ -451,7 +462,8 @@ def complete_checkout(
         idempotency_key: A UUID for retry safety (required by UCP spec).
         payment: Payment credentials / token (optional for sample app).
     """
-    _require_scope("checkout:write")
+    if err := _require_scope("checkout:write"):
+        return err
     checkout = _checkouts.get(id)
     if not checkout:
         return {
@@ -547,7 +559,8 @@ def cancel_checkout(id: str, idempotency_key: str) -> dict:
         id: The checkout session ID to cancel.
         idempotency_key: A UUID for retry safety (required by UCP spec).
     """
-    _require_scope("cart:write")
+    if err := _require_scope("cart:write"):
+        return err
     checkout = _checkouts.get(id)
     if not checkout:
         return {
@@ -560,24 +573,140 @@ def cancel_checkout(id: str, idempotency_key: str) -> dict:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+# Required scope per tool — checked at transport layer before FastMCP runs. Returns 403 for insufficient scope.
 
-# Make transport-level auth optional so unauthenticated clients can connect and
-# call catalog tools. The BearerAuthBackend middleware still runs and populates
-# the token context when a Bearer token is present, so per-tool _require_scope()
-# checks on cart/checkout tools work correctly for authenticated requests.
+_TOOL_REQUIRED_SCOPES: dict[str, str] = {
+    "create_checkout":   "checkout:write",
+    "get_checkout":      "cart:write",
+    "update_checkout":   "cart:write",
+    "complete_checkout": "checkout:write",
+    "cancel_checkout":   "cart:write",
+}
+
+
+def _scopes_from_bearer(authorization: str) -> set[str]:
+    """Extract OAuth scopes from a raw Authorization header value.
+
+    The JWT signature is verified by DescopeProvider; here we only read the
+    payload claims to check the scope set.
+    """
+    if not authorization.lower().startswith("bearer "):
+        return set()
+    token = authorization[7:].strip()
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        claims = _json.loads(base64.urlsafe_b64decode(payload_b64))
+        return set((claims.get("scope") or "").split())
+    except Exception:
+        return set()
+
+
+class _OAuthScopeMiddleware:
+    """Transport-layer OAuth scope enforcement per MCP authorization spec.
+
+    Intercepts ``tools/call`` requests before FastMCP processes them.
+
+    * No token present  → HTTP 401, ``invalid_token``
+    * Token lacks scope → HTTP 403, ``insufficient_scope``
+    * Token OK / tool has no scope requirement → pass through
+    """
+
+    def __init__(self, app: ASGIApp, resource_metadata_url: str | None = None) -> None:
+        self.app = app
+        self.resource_metadata_url = resource_metadata_url
+
+    async def __call__(self, scope: ASGIScope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+
+        # Buffer body so we can peek at the tool name and replay it.
+        chunks: list[bytes] = []
+        more = True
+        while more:
+            msg = await receive()
+            chunks.append(msg.get("body", b""))
+            more = msg.get("more_body", False)
+        body = b"".join(chunks)
+
+        tool_name: str | None = None
+        try:
+            rpc = _json.loads(body)
+            if rpc.get("method") == "tools/call":
+                tool_name = rpc.get("params", {}).get("name")
+        except Exception:
+            pass
+
+        required = _TOOL_REQUIRED_SCOPES.get(tool_name or "")
+        if required:
+            headers_raw: dict[bytes, bytes] = dict(scope.get("headers", []))
+            authorization = headers_raw.get(b"authorization", b"").decode()
+            has_token = authorization.lower().startswith("bearer ")
+
+            if not has_token:
+                await self._send_error(send, 401, "invalid_token", required,
+                                       "Authentication required")
+                return
+
+            if required not in _scopes_from_bearer(authorization):
+                await self._send_error(send, 403, "insufficient_scope", required,
+                                       f"The '{required}' scope is required for this action")
+                return
+
+        replayed = False
+
+        async def replay_receive() -> dict:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+    async def _send_error(
+        self,
+        send: Send,
+        status: int,
+        error_code: str,
+        required_scope: str,
+        description: str,
+    ) -> None:
+
+        www_auth_parts = [
+            f'Bearer error="{error_code}"',
+            f'scope="{required_scope}"',
+            f'error_description="{description}"',
+        ]
+        if self.resource_metadata_url:
+            www_auth_parts.append(f'resource_metadata="{self.resource_metadata_url}"')
+        www_auth = ", ".join(www_auth_parts)
+
+        body = _json.dumps({
+            "error": error_code,
+            "error_description": description,
+            **({"required_scopes": [required_scope]} if error_code == "insufficient_scope" else {}),
+        }).encode()
+
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                (b"www-authenticate", www_auth.encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
 import fastmcp.server.http as _fmcp_http
 
 
 class _OptionalBearerMiddleware:
-    """Passthrough replacement for RequireAuthMiddleware.
-
-    Allows unauthenticated MCP connections. Tools that require auth enforce it
-    themselves via _require_scope(), which raises AuthorizationError (HTTP 403)
-    when the token is missing or lacks the required scope.
-    """
 
     def __init__(self, app, required_scopes=None, resource_metadata_url=None):
-        self.app = app
+        self.app = _OAuthScopeMiddleware(app, resource_metadata_url=resource_metadata_url)
 
     async def __call__(self, scope, receive, send):
         await self.app(scope, receive, send)
