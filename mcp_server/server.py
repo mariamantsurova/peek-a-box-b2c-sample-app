@@ -195,7 +195,6 @@ def lookup_catalog(
         category: Filter by category — one of 'bestsellers', 'new', or 'premium'.
         limit: Maximum number of results to return (default 20).
     """
-    _require_scope("catalog:read")
     results = PRODUCTS
     if category:
         results = [p for p in results if p["category"] == category]
@@ -215,7 +214,6 @@ def get_product(id: str) -> dict:
     Args:
         id: The product ID (e.g. 'box-42').
     """
-    _require_scope("catalog:read")
     product = next((p for p in PRODUCTS if p["id"] == id), None)
     if not product:
         return {
@@ -247,7 +245,7 @@ def create_checkout(
         buyer: Optional buyer info with email, first_name, last_name.
         fulfillment: Optional fulfillment with shipping destinations.
     """
-    _require_scope("cart:write")
+    _require_scope("checkout:write")
     if not line_items:
         return {
             "ucp": {"version": UCP_VERSION, "status": "error"},
@@ -562,6 +560,30 @@ def cancel_checkout(id: str, idempotency_key: str) -> dict:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
+# Make transport-level auth optional so unauthenticated clients can connect and
+# call catalog tools. The BearerAuthBackend middleware still runs and populates
+# the token context when a Bearer token is present, so per-tool _require_scope()
+# checks on cart/checkout tools work correctly for authenticated requests.
+import fastmcp.server.http as _fmcp_http
+
+
+class _OptionalBearerMiddleware:
+    """Passthrough replacement for RequireAuthMiddleware.
+
+    Allows unauthenticated MCP connections. Tools that require auth enforce it
+    themselves via _require_scope(), which raises AuthorizationError (HTTP 403)
+    when the token is missing or lacks the required scope.
+    """
+
+    def __init__(self, app, required_scopes=None, resource_metadata_url=None):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        await self.app(scope, receive, send)
+
+
+_fmcp_http.RequireAuthMiddleware = _OptionalBearerMiddleware
 
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=MCP_PORT)
