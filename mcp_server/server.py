@@ -268,59 +268,10 @@ def _enrich_line_items(line_items: list[dict]) -> tuple[list[dict], list[dict]]:
             enriched.append({**li, "item": {"id": product["id"], "title": product["name"], "price": round(product["price"] * 100)}})
     return enriched, messages
 
-def _payment_handlers() -> dict:
-    """Payment handlers advertised in the UCP envelope (ucp.payment_handlers),
-    keyed by reverse-domain name. Stripe is the handler — the agent submits a
-    tokenized card credential and the business charges it as merchant of record.
-    """
-    return {
-        STRIPE_PAYMENT_HANDLER_ID: [
-            {
-                "version": UCP_VERSION,
-                "spec": f"https://ucp.dev/{UCP_VERSION}/specification/payment-handler-guide",
-                "available_instruments": [
-                    {
-                        "type": "tokenized_card",
-                        "display": {"plain": "Pay with card via Stripe"},
-                        "credential": {
-                            "payment_method": {
-                                "description": {"plain": "A Stripe PaymentMethod or token id (e.g. 'pm_card_visa')"},
-                            },
-                        },
-                    },
-                ],
-            },
-        ],
-    }
-
-
 def _ucp_envelope() -> dict:
-    return {
-        "version": UCP_VERSION,
-        "capabilities": {
-            "dev.ucp.shopping.checkout": [{"version": UCP_VERSION}],
-            "dev.ucp.shopping.catalog":  [{"version": UCP_VERSION}],
-            "dev.ucp.shopping.order":    [{"version": UCP_VERSION}],
-            # Identity Linking — OAuth endpoints are discovered by the platform via
-            # /.well-known/oauth-authorization-server (RFC 8414). Only scopes are
-            # declared here; OAuth URLs do NOT belong in this config block.
-            "dev.ucp.common.identity_linking": [{
-                "version": UCP_VERSION,
-                "config": {
-                    "scopes": {
-                        "openid":  {},
-                        "profile": {"description": {"plain": "Pre-fill buyer name from the user's profile"}},
-                        "email":   {"description": {"plain": "Pre-fill buyer email address"}},
-                        _ORDER_READ_SCOPE: {"description": {"plain": "View your past orders and order history"}},
-                        _CHECKOUT_SCOPE: {"description": {"plain": "Create, update, complete, and cancel checkout sessions on your behalf"}},
-                    },
-                },
-            }],
-        },
-        # Payment handlers (keyed by reverse-domain name) so agents know what
-        # payment instrument to submit at complete_checkout.
-        "payment_handlers": _payment_handlers(),
-    }
+    """Minimal UCP envelope attached to every tool response
+    """
+    return {"version": UCP_VERSION}
 
 def _select_payment_token(payment: Optional[dict]) -> Optional[str]:
     """Pull a Stripe PaymentMethod / token id from the UCP payment.instruments.
