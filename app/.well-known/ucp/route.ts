@@ -29,25 +29,6 @@ export async function GET(request: Request): Promise<Response> {
             version: UCP_VERSION,
             spec: `https://ucp.dev/${UCP_VERSION}/specification/checkout`,
             schema: `https://ucp.dev/${UCP_VERSION}/schemas/shopping/checkout.json`,
-            // Payment handlers, keyed by reverse-domain name. Stripe is the
-            // handler: agents submit a tokenized card and Peek-A-Box charges it
-            // as merchant of record — no raw card data touches the agent.
-            // Spec: https://ucp.dev/specification/payment-handler-guide/
-            config: {
-              payment_handlers: {
-                "com.stripe.payment": {
-                  type: "tokenized_card",
-                  display: { plain: "Pay with card via Stripe" },
-                  credential: {
-                    payment_method: {
-                      description: {
-                        plain: "A Stripe PaymentMethod or token id (e.g. 'pm_card_visa')",
-                      },
-                    },
-                  },
-                },
-              },
-            },
           },
         ],
         "dev.ucp.shopping.catalog": [
@@ -86,6 +67,26 @@ export async function GET(request: Request): Promise<Response> {
                 },
               },
             },
+          },
+        ],
+      },
+      // Payment handlers — keyed by reverse-domain id
+      payment_handlers: {
+        "com.stripe.payment": [
+          {
+            version: UCP_VERSION,
+            spec: `https://ucp.dev/${UCP_VERSION}/specification/payment-handler-guide`,
+            available_instruments: [
+              {
+                type: "tokenized_card",
+                display: { plain: "Pay with card via Stripe" },
+                credential: {
+                  payment_method: {
+                    description: { plain: "A Stripe PaymentMethod or token id (e.g. 'pm_card_visa')" },
+                  },
+                },
+              },
+            ],
           },
         ],
       },

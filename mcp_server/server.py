@@ -274,15 +274,23 @@ def _payment_handlers() -> dict:
     tokenized card credential and the business charges it as merchant of record.
     """
     return {
-        STRIPE_PAYMENT_HANDLER_ID: {
-            "type": "tokenized_card",
-            "display": {"plain": "Pay with card via Stripe"},
-            "credential": {
-                "payment_method": {
-                    "description": {"plain": "A Stripe PaymentMethod or token id (e.g. 'pm_card_visa')"},
-                },
+        STRIPE_PAYMENT_HANDLER_ID: [
+            {
+                "version": UCP_VERSION,
+                "spec": f"https://ucp.dev/{UCP_VERSION}/specification/payment-handler-guide",
+                "available_instruments": [
+                    {
+                        "type": "tokenized_card",
+                        "display": {"plain": "Pay with card via Stripe"},
+                        "credential": {
+                            "payment_method": {
+                                "description": {"plain": "A Stripe PaymentMethod or token id (e.g. 'pm_card_visa')"},
+                            },
+                        },
+                    },
+                ],
             },
-        },
+        ],
     }
 
 
@@ -671,6 +679,8 @@ def complete_checkout(
             "messages": [{"type": "error", "code": "checkout_canceled",
                           "content": "Checkout has been canceled", "severity": "unrecoverable"}],
         }
+    if checkout["status"] == "completed":
+        return {"ucp": _ucp_envelope(), **checkout}
 
     # Carts with more than one item require the user to review and confirm
     # in the storefront before completing. Return the cart link instead.
@@ -714,10 +724,7 @@ def complete_checkout(
     if existing_buyer:
         checkout["buyer"] = existing_buyer
 
-    # Charge the cart via Stripe (the UCP payment handler)
-    if checkout.get("status") == "completed":
-        return {"ucp": _ucp_envelope(), **checkout}
-
+    # Charge the cart via Stripe (the UCP payment handler).
     charge = _charge_via_stripe(checkout, payment, idempotency_key)
 
     if charge["result"] == "failed":
@@ -748,7 +755,7 @@ def complete_checkout(
     # Order confirmation link on the storefront (user signs in normally to view).
     confirm_url = f"{BASE_URL}/cart/confirm?session={checkout['id']}"
 
-    order_id = f"order_{int(time.time() * 1000)}"
+    order_id = checkout["id"].replace("checkout_", "order_", 1)
     # Store a sanitized payment summary
     payment_summary = {
         "status": "captured",
@@ -757,15 +764,6 @@ def complete_checkout(
     }
     if charge.get("payment_intent"):
         payment_summary["payment_intent"] = charge["payment_intent"]
-
-    checkout.update({
-        "status": "completed",
-        "payment": payment_summary,
-        "order": {"id": order_id, "permalink_url": confirm_url},
-    })
-    _save_checkout(checkout)
-
-    # Record the order under the linked user so get_orders (order:read) can list it.
     user_sub = user_claims.get("sub")
     if user_sub:
         _add_order(user_sub, {
@@ -777,6 +775,13 @@ def complete_checkout(
             "permalink_url": confirm_url,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
+
+    checkout.update({
+        "status": "completed",
+        "payment": payment_summary,
+        "order": {"id": order_id, "permalink_url": confirm_url},
+    })
+    _save_checkout(checkout)
 
     response = {"ucp": _ucp_envelope(), **checkout}
     if charge["result"] == "simulated":
