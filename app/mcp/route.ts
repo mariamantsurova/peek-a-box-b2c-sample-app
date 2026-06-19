@@ -30,17 +30,19 @@ async function proxyToMcp(request: Request): Promise<Response> {
     }
   })
 
+  // Buffer the request body instead of streaming it, so the upstream's 401 returns cleanly.
   const hasBody = request.method !== "GET" && request.method !== "HEAD"
+  const body = hasBody ? await request.arrayBuffer() : undefined
+
   let upstream: Response
   try {
     upstream = await fetch(`${MCP_SERVER_URL}/mcp`, {
       method: request.method,
       headers,
-      body: hasBody ? request.body : undefined,
-      // Required when forwarding a streaming request body in Node fetch.
-      duplex: hasBody ? "half" : undefined,
-    } as RequestInit)
-  } catch {
+      body,
+    })
+  } catch (err) {
+    console.error("MCP proxy: could not reach MCP server:", err)
     return Response.json(
       { error: "Could not reach MCP server" },
       { status: 502, headers: CORS_HEADERS }
