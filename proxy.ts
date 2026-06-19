@@ -23,6 +23,7 @@ export default async function middleware(
       "/cart/confirm",
       "/mcp",
       "/.well-known/ucp",
+      "/.well-known/oauth-protected-resource/mcp",
       "/api/ucp/session/*",
     ],
   })
