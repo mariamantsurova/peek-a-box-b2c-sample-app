@@ -29,6 +29,25 @@ export async function GET(request: Request): Promise<Response> {
             version: UCP_VERSION,
             spec: `https://ucp.dev/${UCP_VERSION}/specification/checkout`,
             schema: `https://ucp.dev/${UCP_VERSION}/schemas/shopping/checkout.json`,
+            // Payment handlers, keyed by reverse-domain name. Stripe is the
+            // handler: agents submit a tokenized card and Peek-A-Box charges it
+            // as merchant of record — no raw card data touches the agent.
+            // Spec: https://ucp.dev/specification/payment-handler-guide/
+            config: {
+              payment_handlers: {
+                "com.stripe.payment": {
+                  type: "tokenized_card",
+                  display: { plain: "Pay with card via Stripe" },
+                  credential: {
+                    payment_method: {
+                      description: {
+                        plain: "A Stripe PaymentMethod or token id (e.g. 'pm_card_visa')",
+                      },
+                    },
+                  },
+                },
+              },
+            },
           },
         ],
         "dev.ucp.shopping.catalog": [
@@ -36,6 +55,13 @@ export async function GET(request: Request): Promise<Response> {
             version: UCP_VERSION,
             spec: `https://ucp.dev/${UCP_VERSION}/specification/catalog`,
             schema: `https://ucp.dev/${UCP_VERSION}/schemas/shopping/catalog.json`,
+          },
+        ],
+        "dev.ucp.shopping.order": [
+          {
+            version: UCP_VERSION,
+            spec: `https://ucp.dev/${UCP_VERSION}/specification/order`,
+            schema: `https://ucp.dev/${UCP_VERSION}/schemas/shopping/order.json`,
           },
         ],
         // Identity Linking — OAuth 2.0 Authorization Code + PKCE flow for agents
@@ -49,12 +75,15 @@ export async function GET(request: Request): Promise<Response> {
             version: UCP_VERSION,
             config: {
               scopes: {
-                openid:           {},
-                profile:          { description: { plain: "Pre-fill buyer name from the user's profile" } },
-                email:            { description: { plain: "Pre-fill buyer email address" } },
-                "catalog:read":   { description: { plain: "Browse and search the product catalog" } },
-                "cart:write":     { description: { plain: "Create, update, and cancel checkout sessions" } },
-                "checkout:write": { description: { plain: "Complete a checkout session and place an order" } },
+                openid:  {},
+                profile: { description: { plain: "Pre-fill buyer name from the user's profile" } },
+                email:   { description: { plain: "Pre-fill buyer email address" } },
+                "dev.ucp.shopping.order:read": {
+                  description: { plain: "View your past orders and order history" },
+                },
+                "dev.ucp.shopping.checkout:manage": {
+                  description: { plain: "Create, update, complete, and cancel checkout sessions on your behalf" },
+                },
               },
             },
           },

@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation"
 import { useEffect, useState } from "react"
 import { motion, AnimatePresence } from "motion/react"
 import { X, ArrowLeft, Bot } from "lucide-react"
-import { useSession, useDescope } from "@descope/nextjs-sdk/client"
+import { useSession } from "@descope/nextjs-sdk/client"
 import { useCart, type CartItem } from "@/components/cart-provider"
 import { AppNav } from "@/components/app-nav"
 import { Button } from "@/components/ui/button"
@@ -15,32 +15,9 @@ export default function CartPage() {
   const searchParams = useSearchParams()
   const { items, addToCart, removeFromCart, clearCart, totalPrice } = useCart()
   const { isAuthenticated, isSessionLoading } = useSession()
-  const sdk = useDescope()
   const [agentSession, setAgentSession] = useState<string | null>(null)
   const [sessionLoading, setSessionLoading] = useState(false)
   const [sessionError, setSessionError] = useState<string | null>(null)
-  // True while we're verifying an embedded link token — prevents the
-  // "Sign in to checkout" button from flashing before auth resolves.
-  const [magicLinkVerifying, setMagicLinkVerifying] = useState(
-    () => typeof window !== "undefined" && new URLSearchParams(window.location.search).has("t")
-  )
-
-  // Verify an embedded link token from the continue_url (?t=...).
-  // The MCP server embeds this when Identity Linking is complete so the user
-  // is auto-logged in regardless of which device or browser they use.
-  useEffect(() => {
-    const token = searchParams.get("t")
-    if (!token) return
-
-    // Remove the token from the URL immediately — it's one-time use.
-    const params = new URLSearchParams(searchParams.toString())
-    params.delete("t")
-    const qs = params.size > 0 ? `?${params.toString()}` : ""
-    router.replace(`/cart${qs}`, { scroll: false })
-
-    sdk.magicLink.verify(token).finally(() => setMagicLinkVerifying(false))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
 
   // Hydrate cart from a UCP checkout session created by an agent
   useEffect(() => {
@@ -256,21 +233,21 @@ export default function CartPage() {
                   </dl>
                   <button
                     onClick={handleCheckout}
-                    disabled={isSessionLoading || magicLinkVerifying}
+                    disabled={isSessionLoading}
                     className="mt-6 w-full rounded-full bg-foreground py-3.5 text-base font-medium text-background transition-colors hover:bg-foreground/90 disabled:opacity-50 sm:text-lg"
                   >
-                    {isSessionLoading || magicLinkVerifying
+                    {isSessionLoading
                       ? "Signing you in…"
                       : isAuthenticated
                         ? "Place order"
                         : "Sign in to checkout"}
                   </button>
-                  {items.length >= 2 && isAuthenticated && !isSessionLoading && !magicLinkVerifying && (
+                  {items.length >= 2 && isAuthenticated && !isSessionLoading && (
                     <p className="mt-4 text-center text-base text-muted-foreground sm:text-lg">
                       Due to the high value of items in your cart, you'll be asked to re-verify your identity before your order is confirmed.
                     </p>
                   )}
-                  {!isAuthenticated && !isSessionLoading && !magicLinkVerifying && (
+                  {!isAuthenticated && !isSessionLoading && (
                     <p className="mt-4 text-center text-base text-muted-foreground sm:text-lg">
                       Sign in to complete your purchase.
                     </p>
