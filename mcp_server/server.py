@@ -715,6 +715,9 @@ def complete_checkout(
         checkout["buyer"] = existing_buyer
 
     # Charge the cart via Stripe (the UCP payment handler)
+    if checkout.get("status") == "completed":
+        return {"ucp": _ucp_envelope(), **checkout}
+
     charge = _charge_via_stripe(checkout, payment, idempotency_key)
 
     if charge["result"] == "failed":
