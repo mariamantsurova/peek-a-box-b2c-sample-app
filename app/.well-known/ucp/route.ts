@@ -38,6 +38,13 @@ export async function GET(request: Request): Promise<Response> {
             schema: `https://ucp.dev/${UCP_VERSION}/schemas/shopping/catalog.json`,
           },
         ],
+        "dev.ucp.shopping.order": [
+          {
+            version: UCP_VERSION,
+            spec: `https://ucp.dev/${UCP_VERSION}/specification/order`,
+            schema: `https://ucp.dev/${UCP_VERSION}/schemas/shopping/order.json`,
+          },
+        ],
         // Identity Linking — OAuth 2.0 Authorization Code + PKCE flow for agents
         // to act on behalf of a user. When linked, the agent's token carries user
         // claims so buyer info is pre-filled automatically.
@@ -49,14 +56,37 @@ export async function GET(request: Request): Promise<Response> {
             version: UCP_VERSION,
             config: {
               scopes: {
-                openid:           {},
-                profile:          { description: { plain: "Pre-fill buyer name from the user's profile" } },
-                email:            { description: { plain: "Pre-fill buyer email address" } },
-                "catalog:read":   { description: { plain: "Browse and search the product catalog" } },
-                "cart:write":     { description: { plain: "Create, update, and cancel checkout sessions" } },
-                "checkout:write": { description: { plain: "Complete a checkout session and place an order" } },
+                openid:  {},
+                profile: { description: { plain: "Pre-fill buyer name from the user's profile" } },
+                email:   { description: { plain: "Pre-fill buyer email address" } },
+                "dev.ucp.shopping.order:read": {
+                  description: { plain: "View your past orders and order history" },
+                },
+                "dev.ucp.shopping.checkout:manage": {
+                  description: { plain: "Create, update, complete, and cancel checkout sessions on your behalf" },
+                },
               },
             },
+          },
+        ],
+      },
+      // Payment handlers — keyed by reverse-domain id
+      payment_handlers: {
+        "com.stripe.payment": [
+          {
+            version: UCP_VERSION,
+            spec: `https://ucp.dev/${UCP_VERSION}/specification/payment-handler-guide`,
+            available_instruments: [
+              {
+                type: "tokenized_card",
+                display: { plain: "Pay with card via Stripe" },
+                credential: {
+                  payment_method: {
+                    description: { plain: "A Stripe PaymentMethod or token id (e.g. 'pm_card_visa')" },
+                  },
+                },
+              },
+            ],
           },
         ],
       },

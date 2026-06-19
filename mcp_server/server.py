@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.descope import DescopeProvider
 from fastmcp.server.dependencies import get_access_token
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -28,18 +29,24 @@ UCP_VERSION = "2026-04-08"
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:3000")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 
-# ── Descope management client (for embedded link generation) ──────────────────
-# Only initialized when DESCOPE_MANAGEMENT_KEY is set. If absent, continue_url
-# is returned without an embedded token and users sign in normally.
-_descope_mgmt = None
+_CHECKOUT_SCOPE = "dev.ucp.shopping.checkout:manage"
+_ORDER_READ_SCOPE = "dev.ucp.shopping.order:read"
+
+# ── Stripe payment handler ────────────────────────────────────────────────────
+# UCP keeps payment separate from checkout, so Stripe plugs in as a payment
+# handler: the agent submits a tokenized card and Peek-A-Box (merchant of record)
+# charges it server-side. When STRIPE_SECRET_KEY is unset the charge is simulated
+# so the demo still runs without a Stripe account.
+STRIPE_PAYMENT_HANDLER_ID = "com.stripe.payment"
+_stripe = None
 try:
-    _mgmt_key = os.environ.get("DESCOPE_MANAGEMENT_KEY", "")
-    _proj_id  = os.environ.get("DESCOPE_PROJECT_ID", "")
-    if _mgmt_key and _proj_id:
-        from descope import DescopeClient as _DescopeClient
-        _descope_mgmt = _DescopeClient(project_id=_proj_id, management_key=_mgmt_key)
+    _stripe_key = os.environ.get("STRIPE_SECRET_KEY", "")
+    if _stripe_key:
+        import stripe as _stripe_sdk
+        _stripe_sdk.api_key = _stripe_key
+        _stripe = _stripe_sdk
 except Exception:
-    pass
+    _stripe = None
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -129,9 +136,109 @@ def _require_scope(scope: str) -> dict | None:
     return None
 
 
-# ── In-memory checkout store ──────────────────────────────────────────────────
+def _current_user_sub() -> Optional[str]:
+    """Return the 'sub' (user id) from the current access token, if linked."""
+    try:
+        access_token = get_access_token()
+        if access_token and access_token.token:
+            return _decode_jwt_claims(access_token.token).get("sub") or None
+    except Exception:
+        pass
+    return None
 
+
+# ── Persistence (Render Postgres, with in-memory fallback) ────────────────────
+# Checkouts and orders persist to Postgres when DATABASE_URL is set (e.g. a
+# Render Postgres instance); otherwise they fall back to in-memory dicts so the
+# demo still runs with zero config
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# In-memory fallback (used when DATABASE_URL is unset or Postgres is unavailable).
 _checkouts: dict[str, dict] = {}
+_orders_by_user: dict[str, list[dict]] = {}
+
+try:
+    from psycopg_pool import ConnectionPool as _ConnectionPool
+    from psycopg.types.json import Jsonb as _Jsonb
+except Exception:
+    _ConnectionPool = None
+    _Jsonb = None
+
+_pool = None
+if DATABASE_URL and _ConnectionPool is not None:
+    try:
+        _pool = _ConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False)
+        _pool.open(wait=True, timeout=10)
+        with _pool.connection() as _conn:
+            _conn.execute(
+                "CREATE TABLE IF NOT EXISTS checkouts ("
+                " id TEXT PRIMARY KEY, data JSONB NOT NULL,"
+                " updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            )
+            _conn.execute(
+                "CREATE TABLE IF NOT EXISTS orders ("
+                " id TEXT PRIMARY KEY, user_sub TEXT NOT NULL, data JSONB NOT NULL,"
+                " created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            )
+            _conn.execute(
+                "CREATE INDEX IF NOT EXISTS orders_user_sub_idx"
+                " ON orders (user_sub, created_at DESC)"
+            )
+    except Exception as e:
+        # Configured DB unreachable: log and fall back to in-memory so the server
+        # still starts (a visible signal beats a hard crash for a demo).
+        print(f"[peek-a-box] DATABASE_URL set but Postgres init failed: {e!r}; "
+              "using in-memory store")
+        _pool = None
+
+
+def _save_checkout(checkout: dict) -> None:
+    """Insert or update a checkout session, keyed by its id."""
+    if _pool is None:
+        _checkouts[checkout["id"]] = checkout
+        return
+    with _pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO checkouts (id, data, updated_at) VALUES (%s, %s, now()) "
+            "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()",
+            (checkout["id"], _Jsonb(checkout)),
+        )
+
+
+def _load_checkout(checkout_id: str) -> Optional[dict]:
+    """Load a checkout session by id, or None if it doesn't exist."""
+    if _pool is None:
+        return _checkouts.get(checkout_id)
+    with _pool.connection() as conn:
+        row = conn.execute(
+            "SELECT data FROM checkouts WHERE id = %s", (checkout_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+
+def _add_order(user_sub: str, order: dict) -> None:
+    """Record an order for a user (idempotent on order id)."""
+    if _pool is None:
+        _orders_by_user.setdefault(user_sub, []).append(order)
+        return
+    with _pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO orders (id, user_sub, data) VALUES (%s, %s, %s) "
+            "ON CONFLICT (id) DO NOTHING",
+            (order["id"], user_sub, _Jsonb(order)),
+        )
+
+
+def _load_orders(user_sub: str) -> list[dict]:
+    """Return a user's orders, most recent first."""
+    if _pool is None:
+        return list(reversed(_orders_by_user.get(user_sub, [])))
+    with _pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT data FROM orders WHERE user_sub = %s ORDER BY created_at DESC",
+            (user_sub,),
+        ).fetchall()
+        return [r[0] for r in rows]
 
 def _compute_totals(line_items: list[dict], has_shipping: bool) -> list[dict]:
     subtotal = 0
@@ -161,12 +268,39 @@ def _enrich_line_items(line_items: list[dict]) -> tuple[list[dict], list[dict]]:
             enriched.append({**li, "item": {"id": product["id"], "title": product["name"], "price": round(product["price"] * 100)}})
     return enriched, messages
 
+def _payment_handlers() -> dict:
+    """Payment handlers advertised in the UCP envelope (ucp.payment_handlers),
+    keyed by reverse-domain name. Stripe is the handler — the agent submits a
+    tokenized card credential and the business charges it as merchant of record.
+    """
+    return {
+        STRIPE_PAYMENT_HANDLER_ID: [
+            {
+                "version": UCP_VERSION,
+                "spec": f"https://ucp.dev/{UCP_VERSION}/specification/payment-handler-guide",
+                "available_instruments": [
+                    {
+                        "type": "tokenized_card",
+                        "display": {"plain": "Pay with card via Stripe"},
+                        "credential": {
+                            "payment_method": {
+                                "description": {"plain": "A Stripe PaymentMethod or token id (e.g. 'pm_card_visa')"},
+                            },
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+
+
 def _ucp_envelope() -> dict:
     return {
         "version": UCP_VERSION,
         "capabilities": {
             "dev.ucp.shopping.checkout": [{"version": UCP_VERSION}],
             "dev.ucp.shopping.catalog":  [{"version": UCP_VERSION}],
+            "dev.ucp.shopping.order":    [{"version": UCP_VERSION}],
             # Identity Linking — OAuth endpoints are discovered by the platform via
             # /.well-known/oauth-authorization-server (RFC 8414). Only scopes are
             # declared here; OAuth URLs do NOT belong in this config block.
@@ -174,17 +308,95 @@ def _ucp_envelope() -> dict:
                 "version": UCP_VERSION,
                 "config": {
                     "scopes": {
-                        "openid":        {},
-                        "profile":       {"description": {"plain": "Pre-fill buyer name from the user's profile"}},
-                        "email":         {"description": {"plain": "Pre-fill buyer email address"}},
-                        "catalog:read":   {"description": {"plain": "Browse and search the product catalog"}},
-                        "cart:write":     {"description": {"plain": "Create, update, and cancel checkout sessions"}},
-                        "checkout:write": {"description": {"plain": "Complete a checkout session and place an order"}},
+                        "openid":  {},
+                        "profile": {"description": {"plain": "Pre-fill buyer name from the user's profile"}},
+                        "email":   {"description": {"plain": "Pre-fill buyer email address"}},
+                        _ORDER_READ_SCOPE: {"description": {"plain": "View your past orders and order history"}},
+                        _CHECKOUT_SCOPE: {"description": {"plain": "Create, update, complete, and cancel checkout sessions on your behalf"}},
                     },
                 },
             }],
         },
+        # Payment handlers (keyed by reverse-domain name) so agents know what
+        # payment instrument to submit at complete_checkout.
+        "payment_handlers": _payment_handlers(),
     }
+
+def _select_payment_token(payment: Optional[dict]) -> Optional[str]:
+    """Pull a Stripe PaymentMethod / token id from the UCP payment.instruments.
+
+    Prefers an instrument for the Stripe handler (and one marked 'selected'),
+    then falls back to any instrument that carries a credential token.
+    """
+    if not payment:
+        return None
+    instruments = payment.get("instruments") or []
+    ordered = sorted(
+        instruments,
+        key=lambda i: (i.get("handler_id") != STRIPE_PAYMENT_HANDLER_ID, not i.get("selected")),
+    )
+    for inst in ordered:
+        cred = inst.get("credential") or {}
+        token = cred.get("payment_method") or cred.get("token") or cred.get("id")
+        if token:
+            return token
+    return None
+
+
+def _charge_via_stripe(checkout: dict, payment: Optional[dict], idempotency_key: str) -> dict:
+    """Charge the cart total via Stripe as the UCP payment handler.
+
+    The business is the merchant of record: we create + confirm an off-session
+    PaymentIntent for the server-computed total (never an agent-supplied amount).
+    Returns {"result": "succeeded"|"failed"|"requires_action"|"simulated", ...}.
+
+    Falls back to a simulated capture when Stripe is unconfigured or no payment
+    instrument was supplied, so the demo runs without a Stripe account.
+    """
+    token = _select_payment_token(payment)
+    if _stripe is None or not token:
+        return {"result": "simulated"}
+
+    amount = next(
+        (t.get("amount", 0) for t in checkout.get("totals", []) if t.get("type") == "total"),
+        0,
+    )
+    currency = (checkout.get("currency") or "USD").lower()
+    # The buyer email is back-filled from the verified identity-linking claims
+    # before this runs; pass it as receipt_email so the charge isn't anonymous.
+    buyer_email = (checkout.get("buyer") or {}).get("email")
+    create_params = {
+        "amount": amount,
+        "currency": currency,
+        "payment_method": token,
+        "confirm": True,
+        "off_session": True,
+        "metadata": {"checkout_id": checkout["id"], "source": "ucp"},
+        "idempotency_key": idempotency_key,
+    }
+    if buyer_email:
+        create_params["receipt_email"] = buyer_email
+    try:
+        intent = _stripe.PaymentIntent.create(**create_params)
+    except Exception as e:  # Stripe raises CardError on decline / auth-required
+        return {
+            "result": "failed",
+            "code": getattr(e, "code", None) or "payment_error",
+            "message": getattr(e, "user_message", None) or str(e),
+        }
+
+    status = getattr(intent, "status", None)
+    pi_id = getattr(intent, "id", None)
+    if status == "succeeded":
+        return {"result": "succeeded", "payment_intent": pi_id}
+    if status in ("requires_action", "requires_confirmation", "requires_payment_method"):
+        return {
+            "result": "requires_action",
+            "payment_intent": pi_id,
+            "message": "Payment requires additional authentication (e.g. 3-D Secure).",
+        }
+    return {"result": "failed", "code": "payment_failed", "message": f"Unexpected payment status: {status}"}
+
 
 # ── Catalog tools ─────────────────────────────────────────────────────────────
 
@@ -253,7 +465,7 @@ def create_checkout(
         buyer: Optional buyer info with email, first_name, last_name.
         fulfillment: Optional fulfillment with shipping destinations.
     """
-    if err := _require_scope("checkout:write"):
+    if err := _require_scope(_CHECKOUT_SCOPE):
         return err
     if not line_items:
         return {
@@ -302,30 +514,10 @@ def create_checkout(
 
     checkout_id = f"checkout_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
 
-    # If we know the user's identity (from Identity Linking), generate a
-    # one-time embedded link token so the continue_url auto-logs them in —
-    # regardless of which device or browser they use to follow the link.
-    #
-    # Descope access tokens don't include 'email' by default, so when it's
-    # absent we resolve the user's login ID (email) from their sub via the
-    # management API before calling generate_embedded_link.
+    # Hand-off link to the storefront. The user signs in to Peek-A-Box normally
+    # to review and place the order — the agent's delegated token authorizes the
+    # MCP calls, not the storefront browser session.
     continue_url = f"{BASE_URL}/cart?session={checkout_id}"
-    if _descope_mgmt and user_sub:
-        login_id = user_email  # use JWT email if present
-        if not login_id:
-            try:
-                user_resp = _descope_mgmt.mgmt.user.load_by_user_id(user_sub)
-                login_ids = user_resp.get("user", {}).get("loginIds", [])
-                login_id = login_ids[0] if login_ids else None
-            except Exception:
-                pass
-        if login_id:
-            try:
-                embedded_token = _descope_mgmt.mgmt.user.generate_embedded_link(login_id)
-                if embedded_token:
-                    continue_url += f"&t={embedded_token}"
-            except Exception:
-                pass
 
     checkout = {
         "id": checkout_id,
@@ -355,12 +547,12 @@ def create_checkout(
         })
     if messages:
         checkout["messages"] = messages
-    _checkouts[checkout_id] = checkout
+    _save_checkout(checkout)
     return {"ucp": _ucp_envelope(), **checkout}
 
 
 def _get_checkout_response(id: str) -> dict:
-    checkout = _checkouts.get(id)
+    checkout = _load_checkout(id)
     if not checkout:
         return {
             "ucp": {"version": UCP_VERSION, "status": "error"},
@@ -379,7 +571,7 @@ def get_checkout(id: str) -> dict:
     Args:
         id: The checkout session ID returned by create_checkout.
     """
-    if err := _require_scope("cart:write"):
+    if err := _require_scope(_CHECKOUT_SCOPE):
         return err
     return _get_checkout_response(id)
 
@@ -388,7 +580,7 @@ def get_checkout(id: str) -> dict:
 async def get_checkout_session(request: Request) -> JSONResponse:
     """Public REST endpoint for the Next.js cart to hydrate agent checkout links."""
     checkout_id = request.path_params["id"]
-    checkout = _checkouts.get(checkout_id)
+    checkout = await run_in_threadpool(_load_checkout, checkout_id)
     if not checkout:
         return JSONResponse(
             {"messages": [{"type": "error", "code": "not_found",
@@ -417,9 +609,9 @@ def update_checkout(
         fulfillment: Updated fulfillment / shipping details (optional).
         currency: Updated currency code (optional).
     """
-    if err := _require_scope("cart:write"):
+    if err := _require_scope(_CHECKOUT_SCOPE):
         return err
-    checkout = _checkouts.get(id)
+    checkout = _load_checkout(id)
     if not checkout:
         return {
             "ucp": {"version": UCP_VERSION, "status": "error"},
@@ -445,6 +637,7 @@ def update_checkout(
         "fulfillment": merged_fulfillment,
         "currency": currency or checkout["currency"],
     })
+    _save_checkout(checkout)
     return {"ucp": _ucp_envelope(), **checkout}
 
 
@@ -457,14 +650,23 @@ def complete_checkout(
     """
     Finalize a checkout session and place the order.
 
+    Charges the cart total via Stripe (the UCP payment handler). Peek-A-Box is
+    the merchant of record, so the agent submits a tokenized card — never raw
+    card data. When no Stripe key is configured (or no instrument is supplied)
+    the charge is simulated so the demo still completes.
+
     Args:
         id: The checkout session ID to complete.
-        idempotency_key: A UUID for retry safety (required by UCP spec).
-        payment: Payment credentials / token (optional for sample app).
+        idempotency_key: A UUID for retry safety (also used as the Stripe
+            idempotency key).
+        payment: UCP payment object with one tokenized-card instrument, e.g.
+            {"instruments": [{"handler_id": "com.stripe.payment",
+                              "type": "tokenized_card", "selected": true,
+                              "credential": {"payment_method": "pm_card_visa"}}]}
     """
-    if err := _require_scope("checkout:write"):
+    if err := _require_scope(_CHECKOUT_SCOPE):
         return err
-    checkout = _checkouts.get(id)
+    checkout = _load_checkout(id)
     if not checkout:
         return {
             "ucp": {"version": UCP_VERSION, "status": "error"},
@@ -477,6 +679,8 @@ def complete_checkout(
             "messages": [{"type": "error", "code": "checkout_canceled",
                           "content": "Checkout has been canceled", "severity": "unrecoverable"}],
         }
+    if checkout["status"] == "completed":
+        return {"ucp": _ucp_envelope(), **checkout}
 
     # Carts with more than one item require the user to review and confirm
     # in the storefront before completing. Return the cart link instead.
@@ -496,9 +700,8 @@ def complete_checkout(
             "continue_url": checkout["continue_url"],
         }
 
-    # Extract user identity from the token (if Identity Linking was done).
-    # Use it to fill any missing buyer fields and generate an embedded link
-    # so the permalink_url auto-logs the user in on any device.
+    # Extract user identity from the token (if Identity Linking was done) and
+    # use it to fill any missing buyer fields.
     user_claims: dict = {}
     try:
         access_token = get_access_token()
@@ -507,7 +710,6 @@ def complete_checkout(
     except Exception:
         pass
 
-    user_sub: Optional[str] = user_claims.get("sub") or None
     user_email: Optional[str] = user_claims.get("email") or None
     user_name: Optional[str] = (
         user_claims.get("name") or user_claims.get("given_name") or None
@@ -522,32 +724,76 @@ def complete_checkout(
     if existing_buyer:
         checkout["buyer"] = existing_buyer
 
-    # Generate embedded link for the confirmation URL
-    confirm_url = f"{BASE_URL}/cart/confirm?session={checkout['id']}"
-    if _descope_mgmt and user_sub:
-        login_id = user_email
-        if not login_id:
-            try:
-                user_resp = _descope_mgmt.mgmt.user.load_by_user_id(user_sub)
-                login_ids = user_resp.get("user", {}).get("loginIds", [])
-                login_id = login_ids[0] if login_ids else None
-            except Exception:
-                pass
-        if login_id:
-            try:
-                embedded_token = _descope_mgmt.mgmt.user.generate_embedded_link(login_id)
-                if embedded_token:
-                    confirm_url += f"&t={embedded_token}"
-            except Exception:
-                pass
+    # Charge the cart via Stripe (the UCP payment handler).
+    charge = _charge_via_stripe(checkout, payment, idempotency_key)
 
-    order_id = f"order_{int(time.time() * 1000)}"
+    if charge["result"] == "failed":
+        # Recoverable: the agent may retry complete_checkout with another instrument.
+        return {
+            "ucp": _ucp_envelope(),
+            "status": "incomplete",
+            "messages": [{
+                "type": "error",
+                "code": "payment_declined",
+                "content": charge.get("message", "The payment was declined."),
+                "severity": "recoverable",
+            }],
+        }
+
+    if charge["result"] == "requires_action":
+        return {
+            "ucp": _ucp_envelope(),
+            "status": "requires_action",
+            "messages": [{
+                "type": "info",
+                "code": "payment_authentication_required",
+                "content": charge.get("message", "Payment requires additional authentication."),
+            }],
+            "continue_url": checkout["continue_url"],
+        }
+
+    # Order confirmation link on the storefront (user signs in normally to view).
+    confirm_url = f"{BASE_URL}/cart/confirm?session={checkout['id']}"
+
+    order_id = checkout["id"].replace("checkout_", "order_", 1)
+    # Store a sanitized payment summary
+    payment_summary = {
+        "status": "captured",
+        "handler_id": STRIPE_PAYMENT_HANDLER_ID,
+        "simulated": charge["result"] == "simulated",
+    }
+    if charge.get("payment_intent"):
+        payment_summary["payment_intent"] = charge["payment_intent"]
+    user_sub = user_claims.get("sub")
+    if user_sub:
+        _add_order(user_sub, {
+            "id": order_id,
+            "status": "completed",
+            "currency": checkout.get("currency"),
+            "totals": checkout.get("totals"),
+            "line_items": checkout.get("line_items"),
+            "permalink_url": confirm_url,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+
     checkout.update({
         "status": "completed",
-        "payment": payment,
+        "payment": payment_summary,
         "order": {"id": order_id, "permalink_url": confirm_url},
     })
-    return {"ucp": _ucp_envelope(), **checkout}
+    _save_checkout(checkout)
+
+    response = {"ucp": _ucp_envelope(), **checkout}
+    if charge["result"] == "simulated":
+        response["messages"] = [*checkout.get("messages", []), {
+            "type": "info",
+            "code": "payment_simulated",
+            "content": (
+                "No Stripe key configured or no payment instrument supplied — "
+                "payment was simulated."
+            ),
+        }]
+    return response
 
 
 @mcp.tool()
@@ -559,9 +805,9 @@ def cancel_checkout(id: str, idempotency_key: str) -> dict:
         id: The checkout session ID to cancel.
         idempotency_key: A UUID for retry safety (required by UCP spec).
     """
-    if err := _require_scope("cart:write"):
+    if err := _require_scope(_CHECKOUT_SCOPE):
         return err
-    checkout = _checkouts.get(id)
+    checkout = _load_checkout(id)
     if not checkout:
         return {
             "ucp": {"version": UCP_VERSION, "status": "error"},
@@ -569,26 +815,42 @@ def cancel_checkout(id: str, idempotency_key: str) -> dict:
                           "content": f"Checkout '{id}' not found", "severity": "unrecoverable"}],
         }
     checkout["status"] = "canceled"
+    _save_checkout(checkout)
     return {"ucp": _ucp_envelope(), **checkout}
+
+
+# ── Order tools ───────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_orders() -> dict:
+    """
+    List the authenticated user's past orders (most recent first).
+    """
+    if err := _require_scope(_ORDER_READ_SCOPE):
+        return err
+    sub = _current_user_sub()
+    orders = _load_orders(sub) if sub else []
+    return {"ucp": _ucp_envelope(), "orders": orders, "total": len(orders)}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 # Required scope per tool — checked at transport layer before FastMCP runs. Returns 403 for insufficient scope.
 
 _TOOL_REQUIRED_SCOPES: dict[str, str] = {
-    "create_checkout":   "checkout:write",
-    "get_checkout":      "cart:write",
-    "update_checkout":   "cart:write",
-    "complete_checkout": "checkout:write",
-    "cancel_checkout":   "cart:write",
+    "create_checkout":   _CHECKOUT_SCOPE,
+    "get_checkout":      _CHECKOUT_SCOPE,
+    "update_checkout":   _CHECKOUT_SCOPE,
+    "complete_checkout": _CHECKOUT_SCOPE,
+    "cancel_checkout":   _CHECKOUT_SCOPE,
+    "get_orders":        _ORDER_READ_SCOPE,
 }
 
 
 def _scopes_from_bearer(authorization: str) -> set[str]:
     """Extract OAuth scopes from a raw Authorization header value.
 
-    The JWT signature is verified by DescopeProvider; here we only read the
-    payload claims to check the scope set.
+    Called after RequireAuthMiddleware has verified the JWT; we only read
+    payload claims here to check the scope set.
     """
     if not authorization.lower().startswith("bearer "):
         return set()
@@ -645,13 +907,15 @@ class _OAuthScopeMiddleware:
             has_token = authorization.lower().startswith("bearer ")
 
             if not has_token:
-                await self._send_error(send, 401, "invalid_token", required,
-                                       "Authentication required")
+                # No token at all → identity linking required.
+                await self._send_error(send, 401, "identity_required", required,
+                                       "User identity is required; link an account to continue.")
                 return
 
             if required not in _scopes_from_bearer(authorization):
                 await self._send_error(send, 403, "insufficient_scope", required,
-                                       f"The '{required}' scope is required for this action")
+                                       f"The '{required}' scope is required for this action.",
+                                       www_error="insufficient_scope")
                 return
 
         replayed = False
@@ -669,24 +933,32 @@ class _OAuthScopeMiddleware:
         self,
         send: Send,
         status: int,
-        error_code: str,
+        ucp_code: str,
         required_scope: str,
         description: str,
+        www_error: str | None = None,
     ) -> None:
 
-        www_auth_parts = [
-            f'Bearer error="{error_code}"',
-            f'scope="{required_scope}"',
-            f'error_description="{description}"',
-        ]
+        params: list[str] = []
+        if www_error:
+            params.append(f'error="{www_error}"')
+            params.append(f'error_description="{description}"')
+        params.append(f'scope="{required_scope}"')
         if self.resource_metadata_url:
-            www_auth_parts.append(f'resource_metadata="{self.resource_metadata_url}"')
-        www_auth = ", ".join(www_auth_parts)
+            params.append(f'resource_metadata="{self.resource_metadata_url}"')
+        www_auth = "Bearer " + ", ".join(params)
 
+        # UCP error envelope; the message carries the spec code
+        # (identity_required / insufficient_scope).
         body = _json.dumps({
-            "error": error_code,
-            "error_description": description,
-            **({"required_scopes": [required_scope]} if error_code == "insufficient_scope" else {}),
+            "ucp": {"version": UCP_VERSION, "status": "error"},
+            "messages": [{
+                "type": "error",
+                "code": ucp_code,
+                "content": description,
+                "severity": "unrecoverable",
+            }],
+            **({"required_scopes": [required_scope]} if ucp_code == "insufficient_scope" else {}),
         }).encode()
 
         await send({
@@ -701,18 +973,28 @@ class _OAuthScopeMiddleware:
         await send({"type": "http.response.body", "body": body, "more_body": False})
 
 import fastmcp.server.http as _fmcp_http
+from fastmcp.server.auth.middleware import RequireAuthMiddleware as _BaseRequireAuthMiddleware
 
 
-class _OptionalBearerMiddleware:
+class _ScopedRequireAuthMiddleware:
+    """Require valid Descope auth for every MCP request, with per-tool scope checks.
+
+    Wraps FastMCP's RequireAuthMiddleware (JWT verification) around
+    _OAuthScopeMiddleware (checkout/cart scope enforcement).
+    """
 
     def __init__(self, app, required_scopes=None, resource_metadata_url=None):
-        self.app = _OAuthScopeMiddleware(app, resource_metadata_url=resource_metadata_url)
+        self.app = _BaseRequireAuthMiddleware(
+            _OAuthScopeMiddleware(app, resource_metadata_url=resource_metadata_url),
+            required_scopes,
+            resource_metadata_url,
+        )
 
     async def __call__(self, scope, receive, send):
         await self.app(scope, receive, send)
 
 
-_fmcp_http.RequireAuthMiddleware = _OptionalBearerMiddleware
+_fmcp_http.RequireAuthMiddleware = _ScopedRequireAuthMiddleware
 
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=MCP_PORT)
