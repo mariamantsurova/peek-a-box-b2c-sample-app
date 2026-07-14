@@ -36,3 +36,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# python (mcp_server)
+__pycache__/
+*.pyc
+.venv/
+venv/
