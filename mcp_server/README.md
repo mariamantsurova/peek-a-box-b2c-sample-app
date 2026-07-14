@@ -32,6 +32,12 @@ serves **both** ecosystems:
 A small in-widget bridge (`window.PAB`) normalizes the two host APIs, so the same HTML
 renders, themes (light/dark), and wires buttons on both platforms.
 
+The widgets mirror the storefront's design (see `components/product-card.tsx` and
+`app/styles/globals.css`): the box-logo + `#number` tile, dark foreground-pill badges,
+italic descriptions, `tabular-nums` prices, and the cart's order-summary rows. Because
+the sandboxed iframe can't reach the app's font pipeline, Geist is embedded (subsetted)
+in `_fonts.py` — regenerate it with `python scripts/subset_fonts.py` after `npm install`.
+
 ## Run locally
 
 ```bash
