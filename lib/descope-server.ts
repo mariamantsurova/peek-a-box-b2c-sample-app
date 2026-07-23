@@ -4,7 +4,7 @@ import type { NextRequest } from "next/server"
 export const DESCOPE_PROJECT_COOKIE_NAME = "descope_project_id"
 
 /** Fallback when env/cookie are unset (e.g. CI build). Descope SDK requires a non-empty string. */
-const DEFAULT_PROJECT_ID = "P38wcxH1PyMCpu7uOfALgSHn4zKv"
+const DEFAULT_PROJECT_ID = "P3GVjWtPPHBcC3UuHlF525PME3fs"
 
 /**
  * Get project ID from request (query param, cookie, or env var).

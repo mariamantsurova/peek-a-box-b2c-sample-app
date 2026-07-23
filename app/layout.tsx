@@ -53,7 +53,7 @@ export default async function RootLayout({
           disableTransitionOnChange
         >
           {/* The Descope AuthProvider is a wrapper that provides the auth context to the app */}
-          <AuthProvider projectId={projectId}>
+          <AuthProvider projectId={projectId} baseUrl={process.env.NEXT_PUBLIC_DESCOPE_BASE_URL}>
             <CartProvider>
               <WelcomePopup projectId={projectId} />
               {children}
